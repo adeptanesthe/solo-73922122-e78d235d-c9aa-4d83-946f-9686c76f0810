@@ -12,10 +12,17 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, demo, services
+from . import __version__, demo, photo, photo_demo, services
 from .codes import GridError
 from .db import init_db
-from .schemas import BOX_EXAMPLES, SCAN_EXAMPLES, BoxCreate, ScanCreate
+from .schemas import (
+    BOX_EXAMPLES,
+    PHOTO_EXAMPLES,
+    SCAN_EXAMPLES,
+    BoxCreate,
+    PhotoScanCreate,
+    ScanCreate,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -25,6 +32,7 @@ async def lifespan(app: FastAPI):
     init_db()
     if os.environ.get("SEED_DEMO", "").strip() in {"1", "true", "TRUE", "yes"}:
         demo.seed_demo()
+        photo_demo.seed_photo_demo()
     yield
 
 
@@ -34,9 +42,14 @@ app = FastAPI(
         "5×5 黑白点阵牌册 + 确认读数。四个旋转朝向中任一朝向在可见格上至多错 1 格即命中；"
         "扫码返回候选箱号，唯一命中才确认读数并编号，重扫同一格阵沿用编号。"
         "新牌若与旧箱完整码互命中、或被任一已确认读数命中，则 409 拒绝挂牌。\n\n"
+        "**照片识别**：`POST /api/photo-scans` 接收边长至多 256 像素的 8 位灰度数组"
+        "和 1～4 组图内四角（左上、右上、右下、左下）。每组用透视变换采 5×5 格心；"
+        "只要有一组四角非凸、超过 4 格看不清、不能唯一命中，或各组命中不同箱号，"
+        "本次就不确认任何读数；全部唯一命中同一箱时才一次确认所有不同格阵。\n\n"
         "**演示**：先调用 `POST /api/demo/seed`，再在下方 `POST /api/boxes` 选择 "
         "`demo_blocked_by_occluded_reading` 示例并 Execute，即可看到一条四角遮挡的"
-        "已确认读数拦下新牌并返回冲突箱号与读数编号。"
+        "已确认读数拦下新牌并返回冲突箱号与读数编号；随后在 `POST /api/photo-scans` "
+        "选择 `two_borders_two_grids_same_box`，可看到两个不同格阵认出同一箱。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -73,6 +86,10 @@ def _custom_openapi() -> dict:
         box_mt["examples"] = BOX_EXAMPLES
         scan_mt = schema["paths"]["/api/scans"]["post"]["requestBody"]["content"]["application/json"]
         scan_mt["examples"] = SCAN_EXAMPLES
+        photo_mt = schema["paths"]["/api/photo-scans"]["post"]["requestBody"]["content"][
+            "application/json"
+        ]
+        photo_mt["examples"] = PHOTO_EXAMPLES
     except (KeyError, TypeError):
         pass
     app.openapi_schema = schema
@@ -102,6 +119,11 @@ async def conflict_handler(request: Request, exc: services.ConflictError) -> JSO
     return JSONResponse(status_code=409, content=exc.payload)
 
 
+@app.exception_handler(photo.PhotoError)
+async def photo_error_handler(request: Request, exc: photo.PhotoError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"error": "invalid_photo", "message": str(exc)})
+
+
 # ----------------------------------------------------------------- meta
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -124,9 +146,16 @@ a.btn{display:inline-block;background:#2563eb;color:#fff;padding:.6rem 1.1rem;bo
 <li>用 <code>POST /api/scans</code> 的 <b>occluded_corners</b> 示例重扫：
  同一读数编号、<code>pinned=true</code>、只命中原箱。</li>
 </ol>
+<h2>照片识别（斜拍多边框）</h2>
+<p>在 <code>/docs</code> 打开 <code>POST /api/photo-scans</code>，选择
+ <b>two_borders_two_grids_same_box</b> 并 Execute：同一张 64×64 灰度图的两组
+ 四角采样出两个不同格阵，但都认出 <code>BOX-PHOTO-01</code>，一次确认两条读数、
+ 各给编号；重放沿用原编号。选 <b>non_convex_rejected</b> 可看到蝶形四角导致
+ 整次不确认。</p>
 <pre>docker compose up --build
 # 然后浏览器打开 http://localhost:8000/docs</pre>
 <p>主要接口：<code>POST /api/boxes</code> · <code>POST /api/scans</code> ·
+<code>POST /api/photo-scans</code> ·
 <code>GET /api/boxes</code> · <code>GET /api/readings</code> ·
 <code>GET /api/demo/scenario</code></p>
 </body></html>"""
@@ -166,6 +195,21 @@ def create_scan(payload: ScanCreate) -> dict:
     return services.submit_scan(payload.grid, scanner_id=payload.scanner_id)
 
 
+@app.post(
+    "/api/photo-scans",
+    tags=["scans"],
+    summary="照片识别：8 位灰度图 + 1～4 组四角，全组一致才确认",
+)
+def create_photo_scan(payload: PhotoScanCreate) -> dict:
+    return services.photo_scan(
+        payload.image,
+        payload.borders,
+        width=payload.width,
+        height=payload.height,
+        scanner_id=payload.scanner_id,
+    )
+
+
 @app.get("/api/readings", tags=["readings"], summary="已确认读数列表")
 def get_readings(limit: int = 200) -> dict:
     limit = max(1, min(limit, 10000))
@@ -183,14 +227,16 @@ def get_reading_detail(identifier: str) -> JSONResponse:
 
 # ----------------------------------------------------------------- demo
 
-@app.post("/api/demo/seed", tags=["demo"], summary="幂等写入演示箱与遮挡确认读数")
+@app.post("/api/demo/seed", tags=["demo"], summary="幂等写入演示箱、遮挡确认读数与照片演示箱")
 def demo_seed() -> dict:
-    return demo.seed_demo()
+    result = demo.seed_demo()
+    photo_result = photo_demo.seed_photo_demo()
+    return result | {"photo_demo": photo_result}
 
 
 @app.get("/api/demo/scenario", tags=["demo"], summary="演示脚本与当前相关读数编号")
 def demo_scenario() -> dict:
-    return demo.scenario_payload()
+    return demo.scenario_payload() | {"photo_demo": photo_demo.photo_scenario_payload()}
 
 
 # ------------------------------------------------- compatibility aliases

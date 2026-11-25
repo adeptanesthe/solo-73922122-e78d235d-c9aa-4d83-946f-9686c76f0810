@@ -1,7 +1,7 @@
 # 巡展道具箱 · 点阵牌识别 API
 
 FastAPI + SQLite 实现的 5×5 黑白点阵牌册与确认读数服务。临时添牌也必须保住
-已确认箱号。
+已确认箱号；斜拍照片可用多组候选边框做透视采样后一次识别。
 
 ```bash
 docker compose up --build
@@ -45,12 +45,20 @@ HTTP 409
 5. 再 Execute 一次：`reused=true`、`pinned=true`，仍是 `RD-0001`，
    候选只有原箱。
 6. 换 **valid_new_tag** 示例挂牌 → **201**（差异足够大，不冲突）。
+7. `POST /api/photo-scans` → 示例 **two_borders_two_grids_same_box** →
+   Execute：一张 64×64 灰度图的**两组边框**采样出**两个不同格阵**
+   （外沿多 2 个看不清的格），但都唯一命中同一箱 `BOX-PHOTO-01`，
+   一次确认两条读数、各得编号（`RD-0002` / `RD-0003`）。再 Execute：
+   两个格阵沿用原编号，`reused=true`。
+8. 换 **non_convex_rejected** → 第二组四角是蝶形，`confirmed=false`
+   且不写入任何读数。
 
 也可以在宿主机跑无依赖脚本（Python 标准库）：
 
 ```bash
-python3 scripts/walkthrough.py http://localhost:8000
-python3 scripts/race_check.py  http://localhost:8000 16   # 同时挂牌+扫码
+python3 scripts/walkthrough.py       http://localhost:8000
+python3 scripts/photo_walkthrough.py http://localhost:8000
+python3 scripts/race_check.py        http://localhost:8000 16   # 同时挂牌+扫码
 ```
 
 ## 规则如何落地
@@ -68,6 +76,30 @@ python3 scripts/race_check.py  http://localhost:8000 16   # 同时挂牌+扫码
 | 任一已确认读数命中新牌 → 拒绝并给箱号/读数编号 | 分块索引召回 + 精确复核，409 + `confirmed_reading_matches_new_tag`，给 `conflicting_box_numbers` / `related_reading_ids` |
 | 核查不能全扫已确认读数 | `reading_chunks` 索引表，6 次索引查询取候选，再按主键批量取回复核（见下） |
 | 挂牌/扫码并发正确性 | 进程内 `RLock` 串行化检查+写入；每个操作单事务 `BEGIN IMMEDIATE`，SQLite 写锁兜底多进程；Compose 固定单 worker |
+
+### 照片识别（斜拍多边框）
+
+`POST /api/photo-scans` 的规则落地：
+
+| 需求 | 实现 |
+| --- | --- |
+| 8 位灰度数组，边长 ≤ 256 | `app/photo.py::parse_image`；嵌套二维数组、`{width,height,pixels}` 对象、扁平数组 + `width`/`height` 均可；越界像素/超尺寸 → 422 `invalid_photo` |
+| 1～4 组图内四角，左上/右上/右下/左下 | `PhotoScanCreate.borders`；`[[x,y]×4]`、`{id, corners}`、8 个扁平数字均可；组数越界 → 422 |
+| 透视变换找 5×5 格心 | `homography_coefficients` + `sample_grid`：单位方格 → 四角四边形，取每格 `((c+0.5)/5,(r+0.5)/5)` 的投影点 |
+| 坐标四舍五入后取灰度 | `floor(x + 0.5)` / `floor(y + 0.5)`（真正的四舍五入，不是银行家舍入） |
+| 0～80 黑，176～255 白，其余看不清 | `classify_gray`：≤80 → `1`（黑，与牌册约定一致），≥176 → `0`（白），81～175 → `null` |
+| 逐组按现有规则列候选/无效原因 | 每组用 `match_grid`（四旋转、可见格至多错 1 格）；`groups[]` 给 `candidate_box_numbers` 与 `reason`：`invalid_corners` / `non_convex_corners` / `too_many_unreadable` / `no_unique_hit` |
+| 四角围不成凸四边形 → 不确认 | `is_convex_quad`：四个连续叉积同号且非零；蝶形与共线都拒绝。该组照常报告，但整次 `confirmed=false` |
+| 看不清超过 4 格 → 不确认 | `validate_group_readability` 复用 `MAX_UNREADABLE=4` |
+| 不能唯一命中 / 各组箱号不同 → 不确认 | 任一组候选数 ≠ 1，或各组命中箱号集合大小 ≠ 1，即返回 `confirmed=false`、`readings=[]`、`reasons[]`，**不写任何读数** |
+| 同一箱唯一命中 → 一次确认所有不同格阵 | 单事务内按组顺序确认；相同格阵只写一条（同照片两组采到同一格阵时只给一个编号） |
+| 已有格阵沿用原编号 | 以 `readings.grid_key` 查已有确认读数：复用编号并保持 `pinned`，`reused=true` |
+| 挂牌核查覆盖全部已确认格阵 | 照片确认仍逐条写 `readings` + `reading_chunks`，挂牌的索引冲突核查无需改动即覆盖每条新格阵；并发测试验证“只有外沿遮挡格阵能命中”的新牌被 409 拦下 |
+| 与挂牌并发 | 照片识别整体在 `OPERATION_LOCK` + 单个 `BEGIN IMMEDIATE` 内完成匹配与写入，与挂牌互斥 |
+
+响应要点：顶层 `confirmed` / `box_number` / `box_numbers` /
+`grid_keys_confirmed` / `readings[]` / `groups[]` / `reasons[]`。拒绝时
+`readings` 必为空，`reasons` 给出组级原因或 `box_number_mismatch` 批次原因。
 
 ### “不能全扫已确认读数”的索引原理
 
@@ -92,6 +124,7 @@ python3 scripts/race_check.py  http://localhost:8000 16   # 同时挂牌+扫码
 | `POST /api/boxes` | 登记箱牌；可给 `box_number`，省略则分配 `BX-0001`；冲突 409 |
 | `GET  /api/boxes` / `GET /api/boxes/{box_number}` | 牌册查询 |
 | `POST /api/scans` | 扫码识别；返回候选、确认状态、读数编号 |
+| `POST /api/photo-scans` | 照片识别；8 位灰度图 + 1～4 组四角，全组一致才一次确认 |
 | `GET  /api/readings` / `GET /api/readings/{RD-0001或数字id}` | 确认读数 |
 | `POST /api/demo/seed` / `GET /api/demo/scenario` | 演示数据与现场脚本 |
 | `GET /health` | 健康检查 + 索引计数 |
@@ -101,7 +134,9 @@ python3 scripts/race_check.py  http://localhost:8000 16   # 同时挂牌+扫码
 `/recognize`、`/api/register`、`/api/recognize`。
 字段别名：箱号接受 `box_number/boxNumber/box_no`，格阵接受
 `grid/code/matrix/cells/pattern`。格阵除标准 5×5 数组外，也接受一维 25 格、
-5 个字符串行等常见扫描器格式。
+5 个字符串行等常见扫描器格式。照片接口的 `image` 接受二维数组或
+`{width,height,pixels}`，`borders` 接受 `{id, corners}` / 纯四角数组 /
+8 个扁平数字；`corners` 也可写成 `{x,y}` 对象。
 
 ## 本地开发与测试
 
@@ -109,7 +144,7 @@ python3 scripts/race_check.py  http://localhost:8000 16   # 同时挂牌+扫码
 python3 -m pip install -r requirements-dev.txt
 DB_PATH=data/exhibit.db SEED_DEMO=1 \
   python3 -m uvicorn app.main:app --reload --port 8000
-python3 -m pytest          # 29 个用例：规则/API/索引/并发（含真实 HTTP 竞速）
+python3 -m pytest          # 59 个用例：规则/API/照片识别/索引/并发（含真实 HTTP 竞速）
 ```
 
 SQLite 文件位置由 `DB_PATH` 决定（Compose 中为 `/data/exhibit.db` 命名卷）。
@@ -119,24 +154,29 @@ SQLite 文件位置由 `DB_PATH` 决定（Compose 中为 `/data/exhibit.db` 命�
 ```
 app/
   codes.py        # 格阵解析、旋转、匹配、分块签名（纯逻辑）
+  photo.py        # 照片：灰度图校验、凸四边形判定、透视采样、阈值
   db.py           # SQLite schema、连接、BEGIN IMMEDIATE 事务
   repository.py   # 牌册/读数/块索引的数据访问
-  services.py     # 挂牌、扫码、冲突核查、并发锁、编号钉住
+  services.py     # 挂牌、扫码、照片识别、冲突核查、并发锁、编号钉住
   schemas.py      # pydantic 模型与 /docs 示例
   demo.py         # 遮挡拦截演示数据
+  photo_demo.py   # 一张照片两组边框的确定性演示图与读数
   main.py         # FastAPI 路由、自托管 Swagger、OpenAPI 示例
   static/vendor/  # 本地 swagger-ui js/css
 scripts/
-  walkthrough.py  # 纯标准库端到端演示
-  race_check.py   # 纯标准库并发挂牌/扫码校验
-tests/            # 29 个 pytest 用例
+  walkthrough.py        # 纯标准库端到端演示（挂牌/扫码）
+  photo_walkthrough.py  # 纯标准库照片识别演示
+  race_check.py         # 纯标准库并发挂牌/扫码校验
+tests/            # 59 个 pytest 用例
 Dockerfile docker-compose.yml
 ```
 
 ## 实测结果（本次收尾核对）
 
-- `python3 -m pytest`：**29 passed**（含 4000 组随机索引完备性、
-  1200 条读数暴力预言机比对、真实 uvicorn + 14 线程 HTTP 同时挂牌/扫码）。
+- `python3 -m pytest`：**59 passed**（含 4000 组随机索引完备性、
+  1200 条读数暴力预言机比对、真实 uvicorn + 14 线程 HTTP 同时挂牌/扫码、
+  照片识别的黑白阈值/四舍五入/凸性/透视还原、全组一致才确认、
+  照片与挂牌并发竞速）。
 - 真实 uvicorn 进程 + curl：seed → 拦截牌 **409**
   `['BOX-DEMO-01'] / ['RD-0001']`；重扫同格阵 **200** 且
   `reused=pinned=True`、编号不变；差异新牌 **201**。
@@ -145,7 +185,16 @@ Dockerfile docker-compose.yml
   8 次扫码全部确认到同一 `RD-0002` 且只命中原箱；另跑 30 轮进程内竞速，
   全局“读数只命中钉住箱”违例 **0**；两种合法串行顺序
   （扫码先→挂牌 409；挂牌先→扫码歧义不确认）均单独验证。
-- `/docs` 200，自托管 JS/CSS 200；OpenAPI 含 3 个挂牌示例与 3 个扫码示例。
+- 照片识别（真实 uvicorn + HTTP，见 `scripts/photo_walkthrough.py` 与手工竞速）：
+  同一张 64×64 灰度图、两组边框 → 两个格阵
+  `10010010?00?1011000000101`（外沿，2 格看不清）与
+  `1001001000001011000000101`（内沿，0 格看不清）→ 同一箱
+  `BOX-PHOTO-01`，一次确认 `RD-0002` / `RD-0003`；重放两个格阵都
+  `reused=true` 且编号不变。蝶形四角示例 `confirmed=false` 且读数数不变。
+  12 线程同时到达（6 次照片识别 + 6 次挂牌）：照片先到时 6 次挂牌全 409
+  并引用外沿读数组；挂牌先到时外沿格阵有 2 个候选，照片整次不确认。
+- `/docs` 200，自托管 JS/CSS 200；OpenAPI 含 3 个挂牌示例、3 个扫码示例、
+  2 个照片示例（同一张演示图 + 蝶形拒绝图）。
 
 ## 已知限制 / 待完成事项
 
@@ -160,3 +209,9 @@ Dockerfile docker-compose.yml
 - 无鉴权/多租户/审计日志；读数列表默认返回最近 200 条
   （`?limit=` 可调，上限 10000）。
 - 只实现了需求中的四旋转，不包含镜像翻转。
+- 照片接口只接收**原始 8 位灰度数组**（不做 PNG/JPEG 解码、不自动裁边）；
+  四角由上游扫码器给出，顺序须为左上/右上/右下/左下。数组按顺时针给的
+  凸四边形会被当作旋转了 180° 的牌面（四旋转匹配仍可命中，见
+  `test_photo.py`），但若上游顺序不含旋转语义，请在上游校正。
+- 照片分组共享同一事务与 `OPERATION_LOCK`；单张图最多 4 组、每组固定
+  25 次采样，成本很低，未做额外缓存。

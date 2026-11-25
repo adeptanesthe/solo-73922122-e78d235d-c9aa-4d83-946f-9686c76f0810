@@ -340,3 +340,304 @@ def index_stats() -> dict[str, Any]:
         return repo.chunk_index_stats(conn)
     finally:
         conn.close()
+
+
+
+# ------------------------------------------------------------- photo scans
+
+def _photo_group_report(
+    index: int,
+    group_id: str | None,
+    *,
+    corners: list[list[float]] | None = None,
+    flat: Sequence[int | None] | None = None,
+    reason: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """Stable per-group response shape (all fields always present)."""
+    return {
+        "index": index,
+        "id": group_id,
+        "corners": corners,
+        "valid": reason is None,
+        "reason": reason,
+        "message": message,
+        "grid_key": grid_key(flat) if flat is not None else None,
+        "grid": to_matrix(flat) if flat is not None else None,
+        "unreadable_cells": (
+            sum(1 for v in flat if v is None) if flat is not None else None
+        ),
+        "candidate_box_numbers": [],
+        "candidates": [],
+        "candidate_count": 0,
+        "unique_hit": False,
+        "box_number": None,
+        "match": None,
+        "reading_id": None,
+        "reading_ids": [],
+        "reused": False,
+    }
+
+
+def photo_scan(
+    raw_image: Any,
+    raw_borders: Any,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    scanner_id: str | None = None,
+) -> dict[str, Any]:
+    """Recognize every candidate border of one photo; confirm all or nothing.
+
+    Per group: perspective-sample the 5x5 cell centres, classify black /
+    white / unreadable, then match against the registry with the existing
+    rules.  A group is usable only when it forms a strictly convex
+    quadrilateral, has at most four unreadable cells, and hits exactly one
+    box number.
+
+    Nothing is confirmed if any group is unusable or if usable groups hit
+    different boxes.  Otherwise every *distinct* grid is confirmed in one
+    transaction -- existing grids reuse their original reading numbers --
+    so a later registration check must cover all of them.
+    """
+    from . import photo
+
+    image = photo.parse_image(raw_image, width=width, height=height)
+    if not isinstance(raw_borders, (list, tuple)):
+        raise photo.PhotoError("borders must be a list of 1 to 4 corner groups")
+    if not 1 <= len(raw_borders) <= photo.MAX_BORDERS:
+        raise photo.PhotoError(
+            f"photo has {len(raw_borders)} border group(s); expected 1 to "
+            f"{photo.MAX_BORDERS}"
+        )
+
+    groups: list[dict[str, Any]] = []
+    samples: list[tuple[int, tuple[int | None, ...], dict[str, Any]]] = []
+    for index, raw_group in enumerate(raw_borders):
+        group_id: str | None = None
+        if isinstance(raw_group, dict):
+            group_id = raw_group.get("id") or raw_group.get("name")
+        try:
+            corners, flat = photo.extract_group(image, raw_group)
+        except photo.GroupError as exc:
+            groups.append(
+                _photo_group_report(index, group_id, reason=exc.reason, message=exc.message)
+            )
+            continue
+        report = _photo_group_report(
+            index, group_id, corners=[list(p) for p in corners], flat=flat
+        )
+        try:
+            photo.validate_group_readability(flat)
+        except photo.GroupError as exc:
+            report["reason"] = exc.reason
+            report["message"] = exc.message
+            report["valid"] = False
+            groups.append(report)
+            continue
+        groups.append(report)
+        samples.append((index, flat, report))
+
+    with OPERATION_LOCK:
+        conn = repo_connect()
+        try:
+            with immediate_tx(conn):
+                box_tags = [
+                    (row["box_number"], repo.flat_of_box(row))
+                    for row in repo.list_boxes(conn)
+                ]
+                planned: list[dict[str, Any]] = []
+                for index, flat, report in samples:
+                    key = report["grid_key"]
+                    # Existing confirmed grids are pinned: they only ever
+                    # match their original box and keep their original
+                    # number.  Looked up per grid key (unique-indexed).
+                    pinned = repo.find_reading_by_grid_key(conn, key)
+                    if pinned is not None:
+                        report["candidate_box_numbers"] = [pinned["box_number"]]
+                        report["candidates"] = [pinned["box_number"]]
+                        report["candidate_count"] = 1
+                        report["unique_hit"] = True
+                        report["box_number"] = pinned["box_number"]
+                        report["match"] = {
+                            "box_number": pinned["box_number"],
+                            "orientation": pinned["orientation"],
+                            "mismatches": pinned["mismatches"],
+                            "visible_cells": pinned["visible"],
+                            "pinned": True,
+                        }
+                        planned.append({"flat": flat, "report": report, "pinned": pinned})
+                        continue
+
+                    matches = []
+                    for bn, stored in box_tags:
+                        hit = match_grid(flat, stored)
+                        if hit is not None:
+                            matches.append({"box_number": bn, **hit.as_dict()})
+                    matches.sort(key=lambda m: (m["mismatches"], m["box_number"]))
+                    candidates = sorted({m["box_number"] for m in matches})
+                    report["candidate_box_numbers"] = candidates
+                    report["candidates"] = candidates
+                    report["candidate_count"] = len(candidates)
+                    if not candidates:
+                        report["valid"] = False
+                        report["reason"] = "no_unique_hit"
+                        report["message"] = "photo grid hits no registered box"
+                        continue
+                    if len(candidates) > 1:
+                        report["valid"] = False
+                        report["reason"] = "no_unique_hit"
+                        report["message"] = (
+                            "photo grid hits several registered boxes; cannot pick one"
+                        )
+                        continue
+                    report["unique_hit"] = True
+                    report["box_number"] = candidates[0]
+                    best = min(
+                        (m for m in matches if m["box_number"] == candidates[0]),
+                        key=lambda m: (m["mismatches"], m["orientation"]),
+                    )
+                    report["match"] = best
+                    planned.append({"flat": flat, "report": report, "pinned": None})
+
+                usable = [g for g in groups if g["valid"] and g["unique_hit"]]
+                reasons: list[dict[str, Any]] = []
+                for report in groups:
+                    if report["reason"] is not None:
+                        reasons.append(
+                            {
+                                "scope": "group",
+                                "group_index": report["index"],
+                                "group_id": report["id"],
+                                "reason": report["reason"],
+                                "message": report["message"],
+                            }
+                        )
+                hit_numbers = {g["box_number"] for g in usable}
+                if not reasons and len(usable) == len(groups) and len(hit_numbers) != 1:
+                    for report in groups:
+                        reasons.append(
+                            {
+                                "scope": "batch",
+                                "group_index": report["index"],
+                                "group_id": report["id"],
+                                "reason": "box_number_mismatch",
+                                "message": (
+                                    "groups hit different box numbers "
+                                    f"{sorted(hit_numbers)}; nothing was confirmed"
+                                ),
+                            }
+                        )
+                if not reasons and len(usable) != len(groups):
+                    # Defensive: every unusable planned group must have a
+                    # reason; keep the response self-describing regardless.
+                    for report in groups:
+                        if report["reason"] is None and not report["unique_hit"]:
+                            report["valid"] = False
+                            report["reason"] = "no_unique_hit"
+                            report["message"] = "photo grid could not be matched uniquely"
+                            reasons.append(
+                                {
+                                    "scope": "group",
+                                    "group_index": report["index"],
+                                    "group_id": report["id"],
+                                    "reason": report["reason"],
+                                    "message": report["message"],
+                                }
+                            )
+
+                can_confirm = (
+                    not reasons and len(usable) == len(groups) and len(hit_numbers) == 1
+                )
+                if not can_confirm:
+                    return {
+                        "image": {"width": len(image[0]), "height": len(image)},
+                        "border_count": len(groups),
+                        "confirmed": False,
+                        "box_number": None,
+                        "box_numbers": sorted(hit_numbers),
+                        "grid_keys_confirmed": [],
+                        "readings": [],
+                        "groups": groups,
+                        "reasons": reasons,
+                    }
+
+                box_number = next(iter(hit_numbers))
+                confirmed_by_key: dict[str, dict[str, Any]] = {}
+                for item in planned:
+                    report = item["report"]
+                    key = report["grid_key"]
+                    if key in confirmed_by_key:
+                        # Same grid in two groups: one reading, referenced twice.
+                        entry = confirmed_by_key[key]
+                        report["reading_id"] = entry["reading_id"]
+                        report["reading_ids"] = [entry["reading_id"]]
+                        report["reused"] = entry["reused"]
+                        continue
+
+                    pinned = item["pinned"]
+                    if pinned is not None:
+                        if pinned["box_number"] != box_number:
+                            raise ConflictError(
+                                {
+                                    "error": "reading_box_mismatch",
+                                    "message": (
+                                        f"grid {key} is already pinned to "
+                                        f"{pinned['box_number']}, not {box_number}"
+                                    ),
+                                    "related_reading_ids": [pinned["reading_no"]],
+                                }
+                            )
+                        row = pinned
+                        reused = True
+                    else:
+                        best = report["match"]
+                        _, reading_no = repo.next_reading_number(conn)
+                        reading_pk = repo.insert_reading(
+                            conn,
+                            reading_no=reading_no,
+                            grid_key=key,
+                            flat=item["flat"],
+                            box_number=box_number,
+                            orientation=best["orientation"],
+                            mismatches=best["mismatches"],
+                            visible=best["visible_cells"],
+                            scanner_id=scanner_id,
+                        )
+                        row = repo.get_reading_by_id(conn, reading_pk)
+                        assert row is not None
+                        reused = False
+
+                    entry = {
+                        "group_index": report["index"],
+                        "group_id": report["id"],
+                        "box_number": box_number,
+                        "grid_key": key,
+                        "grid": to_matrix(item["flat"]),
+                        "reading_id": row["reading_no"],
+                        "reading_no": row["reading_no"],
+                        "reading_pk": row["id"],
+                        "orientation": row["orientation"],
+                        "mismatches": row["mismatches"],
+                        "visible_cells": row["visible"],
+                        "reused": reused,
+                    }
+                    confirmed_by_key[key] = entry
+                    report["reading_id"] = entry["reading_id"]
+                    report["reading_ids"] = [entry["reading_id"]]
+                    report["reused"] = reused
+
+                readings = list(confirmed_by_key.values())
+                return {
+                    "image": {"width": len(image[0]), "height": len(image)},
+                    "border_count": len(groups),
+                    "confirmed": True,
+                    "box_number": box_number,
+                    "box_numbers": [box_number],
+                    "grid_keys_confirmed": list(confirmed_by_key),
+                    "readings": readings,
+                    "groups": groups,
+                    "reasons": [],
+                }
+        finally:
+            conn.close()
