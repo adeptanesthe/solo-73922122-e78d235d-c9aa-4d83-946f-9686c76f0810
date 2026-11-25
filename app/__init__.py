@@ -1,0 +1,3 @@
+"""Touring-exhibit prop-box recognition API."""
+
+__version__ = "1.0.0"

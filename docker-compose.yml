@@ -1,0 +1,26 @@
+services:
+  exhibit-api:
+    build: .
+    image: exhibit-recognition-api:latest
+    container_name: exhibit-recognition-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/exhibit.db
+      SEED_DEMO: "1"
+    volumes:
+      - exhibit-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 4s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  exhibit-data:
